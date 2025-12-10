@@ -40,8 +40,8 @@
 
 DSTPORT=4789
 
-# We bind our VXLAN tunnel IP(v4) on Loopback device 'lo'
-DEV="lo"
+# We bind our VXLAN tunnel IP(v4) on Loopback device 'lo1'
+DEV="lo1"
 
 usage() {
     echo ""
