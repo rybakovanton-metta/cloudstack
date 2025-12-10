@@ -35,32 +35,36 @@
 # More information about BGP and EVPN with FRR: https://vincent.bernat.ch/en/blog/2017-vxlan-bgp-evpn
 #
 
+
+
+
 DSTPORT=4789
 
 # We bind our VXLAN tunnel IP(v4) on Loopback device 'lo'
 DEV="lo"
 
 usage() {
-    echo "Usage: $0: -o <op>(add | delete) -v <vxlan id> -p <pif> -b <bridge name> (-6)"
+    echo ""
+    echo "Usage: $0: -o <op>(add | delete) -v <vxlan id> -p <pif_ignored> -b <bridge name> (-6)"
+    echo "Note: BGP-EVPN mode uses loopback interface, pif parameter ignored"
+    echo "CloudStack-compatible BGP-EVPN VXLAN script"
+    echo "Uses first IPv4 address on 'lo' interface as VXLAN source"
+    echo "Requires FRRouting or similar BGP daemon for EVPN route advertisement"
 }
 
 localAddr() {
     local FAMILY=$1
-
-    if [[ -z "$FAMILY" || $FAMILY == "inet" ]]; then
-       ip -4 -o addr show scope global dev ${DEV} | awk 'NR==1 {gsub("/[0-9]+", "") ; print $4}'
-    fi
-
     if [[ "$FAMILY" == "inet6" ]]; then
-       ip -6 -o addr show scope global dev ${DEV} | awk 'NR==1 {gsub("/[0-9]+", "") ; print $4}'
+        ip -6 addr show ${DEV} | grep -oP '(?<=inet6\s)[^/]+' | head -1
+    else
+        ip -4 addr show ${DEV} | grep -oP '(?<=inet\s)[^/]+' | head -1
     fi
 }
 
 addVxlan() {
     local VNI=$1
-    local PIF=$2
-    local VXLAN_BR=$3
-    local FAMILY=$4
+    local VXLAN_BR=$2
+    local FAMILY=$3
     local VXLAN_DEV=vxlan${VNI}
     local ADDR=$(localAddr ${FAMILY})
 
@@ -86,9 +90,8 @@ addVxlan() {
 
 deleteVxlan() {
     local VNI=$1
-    local PIF=$2
-    local VXLAN_BR=$3
-    local FAMILY=$4
+    local VXLAN_BR=$2
+    local FAMILY=$3
     local VXLAN_DEV=vxlan${VNI}
 
     ip link set ${VXLAN_DEV} nomaster
@@ -98,39 +101,25 @@ deleteVxlan() {
     ip link delete ${VXLAN_BR} type bridge
 }
 
-OP=
+OPERATION=
 VNI=
 FAMILY=inet
 option=$@
 
-while getopts 'o:v:p:b:6' OPTION
-do
-  case $OPTION in
-  o)    oflag=1
-        OP="$OPTARG"
-        ;;
-  v)    vflag=1
-        VNI="$OPTARG"
-        ;;
-  p)    pflag=1
-        PIF="$OPTARG"
-        ;;
-  b)    bflag=1
-        BRNAME="$OPTARG"
-        ;;
-  6)
-        FAMILY=inet6
-        ;;
-  ?)    usage
-        exit 2
-        ;;
+# Simple parameter validation
+[[ "$#" -lt 8 ]] && { usage; exit 2; }
+
+while getopts 'o:v:p:b:6' OPTION; do
+    case $OPTION in
+        o) OPERATION="$OPTARG" ;;
+        v) VNI="$OPTARG"   ;;
+        p) IGNORED_PIF="$OPTARG"   ;;
+        b) BRNAME="$OPTARG"    ;;
+        6) FAMILY=inet6    ;;
+        ?) usage; exit 2   ;;
   esac
 done
 
-if [[ "$oflag$vflag$pflag$bflag" != "1111" ]]; then
-    usage
-    exit 2
-fi
 
 lsmod|grep ^vxlan >& /dev/null
 if [[ $? -gt 0 ]]; then
@@ -151,13 +140,22 @@ LOCKFILE=/var/run/cloud/vxlan.lock
 
 (
     flock -x -w 10 200 || exit 1
-    if [[ "$OP" == "add" ]]; then
-        addVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
-
-        if [[ $? -gt 0 ]]; then
-            exit 1
-        fi
-    elif [[ "$OP" == "delete" ]]; then
-        deleteVxlan ${VNI} ${PIF} ${BRNAME} ${FAMILY}
-    fi
+      case $OPERATION in
+          add)
+              if ! addVxlan ${VNI} ${BRNAME} ${FAMILY}; then
+                  echo "Error: Failed to add VXLAN $VNI"
+                  exit 1
+              fi
+              ;;
+          delete)
+              if ! deleteVxlan ${VNI} ${BRNAME} ${FAMILY}; then
+                  echo "Error: Failed to delete VXLAN $VNI"
+                  exit 1
+              fi
+              ;;
+          *)
+              echo "Error: Invalid operation '$OPERATION'"
+              exit 1
+              ;;
+      esac
 ) 200>${LOCKFILE}
