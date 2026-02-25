@@ -184,6 +184,7 @@ import com.cloud.vm.dao.SecondaryStorageVmDao;
 import com.cloud.vm.dao.UserVmCloneSettingDao;
 import com.cloud.vm.dao.UserVmDao;
 import com.cloud.vm.dao.VMInstanceDetailsDao;
+import com.cloud.vm.dao.VMInstanceDao;
 
 public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrationService, Configurable {
 
@@ -270,6 +271,8 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
     ConfigDepot configDepot;
     @Inject
     ConfigurationDao configurationDao;
+    @Inject
+    VMInstanceDao vmInstanceDao;
 
     @Inject
     protected SnapshotHelper snapshotHelper;
@@ -581,12 +584,16 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         DataStore store = dataStoreMgr.getDataStore(pool.getId(), DataStoreRole.Primary);
         DataStoreRole dataStoreRole = snapshotHelper.getDataStoreRole(snapshot, zoneId);
         SnapshotInfo snapInfo = snapshotFactory.getSnapshotWithRoleAndZone(snapshot.getId(), dataStoreRole, zoneId);
+        boolean kvmSnapshotOnlyInPrimaryStorage = snapshotHelper.isKvmSnapshotOnlyInPrimaryStorage(snapshot, dataStoreRole, zoneId);
+        logger.debug("Creating volume from snapshot, with dataStore role {} and on primary storage: {}", dataStoreRole, kvmSnapshotOnlyInPrimaryStorage);
 
-        boolean kvmSnapshotOnlyInPrimaryStorage = snapshotHelper.isKvmSnapshotOnlyInPrimaryStorage(snapshot, dataStoreRole, volume.getDataCenterId());
-        boolean storageSupportSnapshotToTemplateEnabled = snapshotHelper.isStorageSupportSnapshotToTemplate(snapInfo);
-
+        boolean storageSupportSnapshotToTemplateEnabled = snapshotHelper.isStorageSupportSnapshotToTemplate(snapInfo); // storageSupportSnapshotToTemplateEnabled is true only for StorPool now [TODO: Update to check storage supports snapshot to volume (DataStoreCapabilities.CAN_CREATE_VOLUME_FROM_SNAPSHOT) - may impact other storages, or StorPool storage type only]
         try {
             if (!storageSupportSnapshotToTemplateEnabled) {
+                dataStoreRole = snapshotHelper.getDataStoreRole(snapshot);
+                snapInfo = snapshotFactory.getSnapshotWithRoleAndZone(snapshot.getId(), dataStoreRole, zoneId);
+                kvmSnapshotOnlyInPrimaryStorage = snapshotHelper.isKvmSnapshotOnlyInPrimaryStorage(snapshot, dataStoreRole);
+                logger.debug("Creating volume from snapshot, with dataStore role {} and on primary storage: {}", dataStoreRole, kvmSnapshotOnlyInPrimaryStorage);
                 snapInfo = snapshotHelper.backupSnapshotToSecondaryStorageIfNotExists(snapInfo, dataStoreRole, snapshot, kvmSnapshotOnlyInPrimaryStorage);
             }
         } catch (CloudRuntimeException e) {
@@ -600,7 +607,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         }
 
         // don't try to perform a sync if the DataStoreRole of the snapshot is equal to DataStoreRole.Primary
-        if (!DataStoreRole.Primary.equals(dataStoreRole) || !storageSupportSnapshotToTemplateEnabled) {
+        if (!DataStoreRole.Primary.equals(dataStoreRole) || (kvmSnapshotOnlyInPrimaryStorage && !storageSupportSnapshotToTemplateEnabled)) {
             try {
                 // sync snapshot to region store if necessary
                 DataStore snapStore = snapInfo.getDataStore();
@@ -620,13 +627,13 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         try {
             VolumeApiResult result = future.get();
             if (result.isFailed()) {
-                String logMsg = String.format("Failed to create volume from snapshot [%s] due to [%s].", snapshotToString, result.getResult());
+                String logMsg = String.format("Failed to create volume from Snapshot [%s] due to [%s].", snapshotToString, result.getResult());
                 logger.error(logMsg);
                 throw new CloudRuntimeException(logMsg);
             }
             return result.getVolume();
         } catch (InterruptedException | ExecutionException e) {
-            String message = String.format("Failed to create volume from snapshot [%s] due to [%s].", snapshotToString, e.getMessage());
+            String message = String.format("Failed to create volume from Snapshot [%s] due to [%s].", snapshotToString, e.getMessage());
             logger.error(message);
             logger.debug("Exception: ", e);
             throw new CloudRuntimeException(message, e);
@@ -752,7 +759,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
                 VolumeApiResult result = future.get();
                 if (result.isFailed()) {
                     if (result.getResult().contains(REQUEST_TEMPLATE_RELOAD) && (i == 0)) {
-                        logger.debug("Retrying to deploy template [{}] for VMware, attempt 2/2. ", templateToString);
+                        logger.debug("Retrying to deploy Template [{}] for VMware, attempt 2/2. ", templateToString);
                         continue;
                     } else {
                         String msg = String.format("Failed to create volume [%s] due to [%s].", volumeToString, result.getResult());
@@ -768,7 +775,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
                 throw new CloudRuntimeException(msg, e);
             }
         }
-        throw new CloudRuntimeException(String.format("Failed to create volume [%s] even after retrying to deploy the template.", volumeToString));
+        throw new CloudRuntimeException(String.format("Failed to create volume [%s] even after retrying to deploy the Template.", volumeToString));
     }
 
     private String getReflectOnlySelectedFields(Object obj) {
@@ -896,7 +903,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         // Save usage event and update resource count for user vm volumes
         if (vm.getType() == VirtualMachine.Type.User) {
             UsageEventUtils.publishUsageEvent(EventTypes.EVENT_VOLUME_CREATE, vol.getAccountId(), vol.getDataCenterId(), vol.getId(), vol.getName(), offering.getId(), null, size,
-                    Volume.class.getName(), vol.getUuid(), vol.isDisplayVolume());
+                    Volume.class.getName(), vol.getUuid(), vol.getInstanceId(), vol.isDisplayVolume());
             _resourceLimitMgr.incrementVolumeResourceCount(vm.getAccountId(), vol.isDisplayVolume(), vol.getSize(), offering);
         }
         DiskProfile diskProfile = toDiskProfile(vol, offering);
@@ -968,15 +975,13 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
 
         // Create event and update resource count for volumes if vm is a user vm
         if (vm.getType() == VirtualMachine.Type.User) {
-
             Long offeringId = null;
-
             if (!offering.isComputeOnly()) {
                 offeringId = offering.getId();
             }
 
             UsageEventUtils.publishUsageEvent(EventTypes.EVENT_VOLUME_CREATE, vol.getAccountId(), vol.getDataCenterId(), vol.getId(), vol.getName(), offeringId, vol.getTemplateId(), size,
-                    Volume.class.getName(), vol.getUuid(), vol.isDisplayVolume());
+                    Volume.class.getName(), vol.getUuid(), vol.getInstanceId(), vol.isDisplayVolume());
 
             _resourceLimitMgr.incrementVolumeResourceCount(vm.getAccountId(), vol.isDisplayVolume(), vol.getSize(), offering);
         }
@@ -1121,7 +1126,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
                 callContext.setEventResourceId(volumeIds.get(0));
             }
             String volumeUuids = volumeIds.stream().map(volumeId -> this._uuidMgr.getUuid(Volume.class, volumeId)).collect(Collectors.joining(", "));
-            callContext.setEventDetails("Volume Type: " + type + "Volume Id: " + volumeUuids + " Vm Id: " + this._uuidMgr.getUuid(VirtualMachine.class, vm.getId()));
+            callContext.setEventDetails("Volume Type: " + type + "Volume ID: " + volumeUuids + " Instance ID: " + vm.getUuid());
         }
     }
 
@@ -1361,7 +1366,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         // Create new context and inject correct event resource type, id and details,
         // otherwise VOLUME.DESTROY event will be associated with VirtualMachine and contain VM id and other information.
         CallContext volumeContext = CallContext.register(CallContext.current(), ApiCommandResourceType.Volume);
-        volumeContext.setEventDetails("Volume Type: " + volume.getVolumeType() + " Volume Id: " +  volume.getUuid() + " Vm Id: " + _uuidMgr.getUuid(VirtualMachine.class, volume.getInstanceId()));
+        volumeContext.setEventDetails("Volume Type: " + volume.getVolumeType() + " Volume ID: " +  volume.getUuid() + " Instance ID: " + _uuidMgr.getUuid(VirtualMachine.class, volume.getInstanceId()));
         volumeContext.setEventResourceType(ApiCommandResourceType.Volume);
         volumeContext.setEventResourceId(volume.getId());
         try {
@@ -1418,7 +1423,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
         String volumeToString = getVolumeIdentificationInfos(volume);
 
         VolumeInfo vol = volFactory.getVolume(volume.getId());
-        if (vol == null){
+        if (vol == null) {
             throw new CloudRuntimeException(String.format("Volume migration failed because volume [%s] is null.", volumeToString));
         }
         if (destPool == null) {
@@ -1496,7 +1501,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
             String storagePoolToString = getReflectOnlySelectedFields(storagePool);
 
             if (volume.getInstanceId() != vm.getId()) {
-                throw new CloudRuntimeException(String.format("Volume [%s] that has to be migrated, but it doesn't belong to the instance [%s].", volumeToString, vm));
+                throw new CloudRuntimeException(String.format("Volume [%s] that has to be migrated, but it doesn't belong to the Instance [%s].", volumeToString, vm));
             }
 
             if (destPool == null) {
@@ -1578,12 +1583,8 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
             vm.addDisk(disk);
         }
 
-        //if (vm.getType() == VirtualMachine.Type.User && vm.getTemplate().getFormat() == ImageFormat.ISO) {
         if (vm.getType() == VirtualMachine.Type.User) {
             _tmpltMgr.prepareIsoForVmProfile(vm, dest);
-            //DataTO dataTO = tmplFactory.getTemplate(vm.getTemplate().getId(), DataStoreRole.Image, vm.getVirtualMachine().getDataCenterId()).getTO();
-            //DiskTO iso = new DiskTO(dataTO, 3L, null, Volume.Type.ISO);
-            //vm.addDisk(iso);
         }
     }
 
@@ -1939,14 +1940,18 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
 
         if (newSize != vol.getSize()) {
             DiskOfferingVO diskOffering = diskOfferingDao.findByIdIncludingRemoved(vol.getDiskOfferingId());
-            if (newSize > vol.getSize()) {
-                _resourceLimitMgr.checkPrimaryStorageResourceLimit(_accountMgr.getActiveAccountById(vol.getAccountId()),
-                        vol.isDisplay(), newSize - vol.getSize(), diskOffering);
-                _resourceLimitMgr.incrementVolumePrimaryStorageResourceCount(vol.getAccountId(), vol.isDisplay(),
-                        newSize - vol.getSize(), diskOffering);
-            } else {
-                _resourceLimitMgr.decrementVolumePrimaryStorageResourceCount(vol.getAccountId(), vol.isDisplay(),
-                        vol.getSize() - newSize, diskOffering);
+            VMInstanceVO vm = vol.getInstanceId() != null ? vmInstanceDao.findById(vol.getInstanceId()) : null;
+            if (vm == null || vm.getType() == VirtualMachine.Type.User) {
+                // Update resource count for user vm volumes when volume is attached
+                if (newSize > vol.getSize()) {
+                    _resourceLimitMgr.checkPrimaryStorageResourceLimit(_accountMgr.getActiveAccountById(vol.getAccountId()),
+                            vol.isDisplay(), newSize - vol.getSize(), diskOffering);
+                    _resourceLimitMgr.incrementVolumePrimaryStorageResourceCount(vol.getAccountId(), vol.isDisplay(),
+                            newSize - vol.getSize(), diskOffering);
+                } else {
+                    _resourceLimitMgr.decrementVolumePrimaryStorageResourceCount(vol.getAccountId(), vol.isDisplay(),
+                            vol.getSize() - newSize, diskOffering);
+                }
             }
             vol.setSize(newSize);
             _volsDao.persist(vol);
@@ -2299,6 +2304,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
                 StoragePoolVO pool = _storagePoolDao.findByUuid(updatedDataStoreUUID);
                 if (pool != null) {
                     vol.setPoolId(pool.getId());
+                    vol.setPoolType(pool.getPoolType());
                 }
             }
             _volsDao.update(volumeId, vol);
@@ -2308,7 +2314,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
     @Override
     public DiskProfile importVolume(Type type, String name, DiskOffering offering, Long sizeInBytes, Long minIops, Long maxIops,
                                     Long zoneId, HypervisorType hypervisorType, VirtualMachine vm, VirtualMachineTemplate template, Account owner,
-                                    Long deviceId, Long poolId, String path, String chainInfo) {
+                                    Long deviceId, Long poolId, Storage.StoragePoolType poolType, String path, String chainInfo) {
         if (sizeInBytes == null) {
             sizeInBytes = offering.getDiskSize();
         }
@@ -2349,6 +2355,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
 
         vol.setFormat(getSupportedImageFormatForCluster(hypervisorType));
         vol.setPoolId(poolId);
+        vol.setPoolType(poolType);
         vol.setPath(path);
         vol.setChainInfo(chainInfo);
         vol.setState(Volume.State.Ready);
@@ -2358,7 +2365,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
 
     @Override
     public DiskProfile updateImportedVolume(Type type, DiskOffering offering, VirtualMachine vm, VirtualMachineTemplate template,
-                                    Long deviceId, Long poolId, String path, String chainInfo, DiskProfile diskProfile) {
+                                    Long deviceId, Long poolId, Storage.StoragePoolType poolType, String path, String chainInfo, DiskProfile diskProfile) {
 
         VolumeVO vol = _volsDao.findById(diskProfile.getVolumeId());
         if (vm != null) {
@@ -2392,6 +2399,7 @@ public class VolumeOrchestrator extends ManagerBase implements VolumeOrchestrati
 
         vol.setFormat(getSupportedImageFormatForCluster(vm.getHypervisorType()));
         vol.setPoolId(poolId);
+        vol.setPoolType(poolType);
         vol.setPath(path);
         vol.setChainInfo(chainInfo);
         vol.setSize(diskProfile.getSize());
