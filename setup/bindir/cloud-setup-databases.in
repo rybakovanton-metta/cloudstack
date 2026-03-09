@@ -288,6 +288,9 @@ for full help
             self.runMysql(text, p, self.rootuser != None)
             self.info(None, True)
 
+        # Check for management.network.cidr override in server.properties
+        self.checkManagementCidrOverride()
+
         p = os.path.join(self.dbFilesPath,"schema-level.sql")
         if os.path.isfile(p):
             text = open(p).read()
@@ -332,6 +335,51 @@ for example:
             self.putDbProperty("region.id", self.options.regionid)
 
         prepareDBDotProperties()
+
+    def checkManagementCidrOverride(self):
+        """Check for management.network.cidr in server.properties and pre-populate in database"""
+        import re
+        import os
+        
+        serverPropsPath = '/etc/cloudstack/management/server.properties'
+        
+        try:
+            if os.path.exists(serverPropsPath):
+                self.info("Checking for management.network.cidr override in server.properties", None)
+                
+                with open(serverPropsPath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('management.network.cidr=') and not line.startswith('#'):
+                            mgmtCidr = line.split('=', 1)[1].strip()
+                            
+                            if mgmtCidr:
+                                # Validate CIDR format (basic IPv4 CIDR validation)
+                                cidr_pattern = r'^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$'
+                                if re.match(cidr_pattern, mgmtCidr):
+                                    self.info("Found management.network.cidr: %s" % mgmtCidr, True)
+                                    
+                                    # Insert into database configuration table
+                                    sql = """INSERT INTO configuration (category, instance, component, name, value, description) 
+                                             VALUES ('Advanced', 'DEFAULT', 'management-server', 'management.network.cidr', '%s', 'Management network CIDR from server.properties') 
+                                             ON DUPLICATE KEY UPDATE 
+                                                 value = '%s',
+                                                 description = 'Management network CIDR from server.properties'""" % (mgmtCidr, mgmtCidr)
+                                    
+                                    self.runMysql(sql, 'management-cidr-override', False)
+                                    self.info("Pre-populated management.network.cidr in database", True)
+                                    return
+                                else:
+                                    self.info("Invalid CIDR format in server.properties: %s (expected: x.x.x.x/xx)" % mgmtCidr, False)
+                            break
+                
+                self.info("No management.network.cidr found in server.properties", True)
+            else:
+                self.info("Server properties file not found - will use CloudStack auto-detection", True)
+                
+        except Exception as e:
+            self.info("Error reading server.properties: %s" % str(e), False)
+            self.info("Falling back to CloudStack auto-detection", True)
 
     def finalize(self):
         def finalizeDbProperties():
