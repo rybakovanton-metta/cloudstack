@@ -611,4 +611,25 @@ public class VolumeServiceTest extends TestCase{
 
         volumeServiceImplSpy.validateChangeDiskOfferingEncryptionType(1L, 2L);
     }
+
+    @Test
+    public void testEnsureVolumeIsExpungeReadyWithNullPodId() {
+        VolumeVO volume = Mockito.mock(VolumeVO.class);
+        Mockito.when(volume.getPodId()).thenReturn(1L);
+        Mockito.when(volumeDaoMock.findById(1L)).thenReturn(volume);
+
+        volumeServiceImplSpy.ensureVolumeIsExpungeReady(1L);
+
+        Mockito.verify(volume).setPodId(null);
+        Mockito.verify(volumeDaoMock).update(1L, volume);
+    }
+
+    @Test
+    public void testEnsureVolumeIsExpungeReadyWithNullVolume() {
+        Mockito.when(volumeDaoMock.findById(1L)).thenReturn(null);
+
+        volumeServiceImplSpy.ensureVolumeIsExpungeReady(1L);
+
+        Mockito.verify(volumeDaoMock, Mockito.never()).update(Mockito.anyLong(), Mockito.any());
+    }
 }
