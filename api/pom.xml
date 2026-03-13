@@ -85,6 +85,27 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-maven</artifactId>
+                <configuration>
+                    <targetClasses>
+                        <param>com.cloud.network.*</param>
+                        <param>org.apache.cloudstack.api.*</param>
+                    </targetClasses>
+                    <targetTests>
+                        <param>com.cloud.network.*Test</param>
+                        <param>org.apache.cloudstack.api.*Test</param>
+                    </targetTests>
+                    <mutators>
+                        <mutator>DEFAULTS</mutator>
+                    </mutators>
+                    <outputFormats>
+                        <format>HTML</format>
+                    </outputFormats>
+                    <threads>4</threads>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>

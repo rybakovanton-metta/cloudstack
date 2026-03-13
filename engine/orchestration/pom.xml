@@ -92,6 +92,25 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.pitest</groupId>
+                <artifactId>pitest-maven</artifactId>
+                <configuration>
+                    <targetClasses>
+                        <param>org.apache.cloudstack.engine.orchestration.*</param>
+                    </targetClasses>
+                    <targetTests>
+                        <param>org.apache.cloudstack.engine.orchestration.*Test</param>
+                    </targetTests>
+                    <mutators>
+                        <mutator>DEFAULTS</mutator>
+                    </mutators>
+                    <outputFormats>
+                        <format>HTML</format>
+                    </outputFormats>
+                    <threads>4</threads>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
